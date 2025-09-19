@@ -13,6 +13,7 @@ from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
+import time
 
 def is_main(): return int(os.environ.get("RANK","0")) == 0
 def setup_ddp():
@@ -134,10 +135,11 @@ class NesterovGlobalState:
             dist.all_reduce(p.data, op=dist.ReduceOp.SUM)
             p_avg=(p.data/world_size).float()
             s,v=self.shadow[n],self.v[n]
-            d=p_avg - s
+            d=s-p_avg
             v.mul_(mu).add_(d)
             s.add_(-lr_nes*(mu*v + d))
             p.data.copy_(s.to(p.data.dtype))
+        #以下操作确保参数一致，但理论上是多余的
         for _,p in model.named_parameters():
             if p.requires_grad: dist.broadcast(p.data, src=0)
 
@@ -152,12 +154,12 @@ def main():
     ap=argparse.ArgumentParser()
     ap.add_argument("--model_name",type=str,default="allenai/OLMo-2-0425-1B") # 已存在于本机 HF 缓存
     ap.add_argument("--per_device_batch",type=int,default=16)
-    ap.add_argument("--epochs",type=int,default=2)
-    ap.add_argument("--lr",type=float,default=0.00007)
+    ap.add_argument("--epochs",type=int,default=1)
+    ap.add_argument("--lr",type=float,default=7.5e-5)
     ap.add_argument("--weight_decay",type=float,default=0.01)
     ap.add_argument("--H",type=int,default=30)
     ap.add_argument("--mu",type=float,default=0.9)
-    ap.add_argument("--lr_nes",type=float,default=0.0005)
+    ap.add_argument("--lr_nes",type=float,default=0.7)
     ap.add_argument("--max_length",type=int,default=2048)
     ap.add_argument("--max_new_tokens",type=int,default=256)
     ap.add_argument("--max_train_samples",type=int,default=-1)
@@ -206,7 +208,10 @@ def main():
     #定义4种mode，0=DiLoCo，1=DiLoCo-all，2=DDP
     mode = args.mode
     print(f"computing with mode = {mode}")
-    if is_main(): print(f"[Train] world={world} epochs={args.epochs} H={args.H} mu={args.mu} lr_nes={args.lr_nes}")
+    if is_main(): 
+        print(f"[Train] world={world} epochs={args.epochs} H={args.H} mu={args.mu} lr_nes={args.lr_nes}")
+        begin = time.time()
+
     step_since_sync=0
     for ep in range(args.epochs):
         sampler.set_epoch(ep); ddp.train()
@@ -279,7 +284,9 @@ def main():
         return  # 结束该进程；只保留 rank0 继续执行下方评测
     
     if rank==0:
-        testnum = 100
+        end = time.time()
+        print(f"Training Total time: {end-begin:.2f} seconds")
+        testnum = 2000
         ddp.module.eval(); correct=0
         for i in range(len(eval_ds)):
             row=eval_ds[i]
@@ -295,6 +302,8 @@ def main():
             if (i+1)%50==0: print(f"[Eval] {i+1}/{len(eval_ds)} acc={correct/(i+1):.4f}")
             if i+1>=testnum: break
         print(f"GSM8K test accuracy: {correct/(i+1):.4f} ({correct}/{i+1})")
+        end = time.time()
+        print(f"Total time: {end-begin:.2f} seconds")
         #print(f"GSM8K test accuracy: {correct/len(eval_ds):.4f} ({correct}/{len(eval_ds)})")
         destroy_pg()
 

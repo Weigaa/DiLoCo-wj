@@ -158,7 +158,7 @@ class NesterovGlobalState:
             dist.all_reduce(p.data, op=dist.ReduceOp.SUM)
             p_avg = (p.data / world_size).float()
             s, v = self.shadow[n], self.v[n]
-            d = p_avg - s
+            d=s-p_avg
             v.mul_(mu).add_(d)
             s.add_(-lr_nes * (mu * v + d))
             p.data.copy_(s.to(p.data.dtype))
@@ -179,12 +179,12 @@ def main():
     ap=argparse.ArgumentParser()
     ap.add_argument("--model_name",type=str,default="allenai/OLMo-2-0425-1B") # 已存在于本机 HF 缓存
     ap.add_argument("--per_device_batch",type=int,default=16)
-    ap.add_argument("--epochs",type=int,default=2)
-    ap.add_argument("--lr",type=float,default=0.00007)
+    ap.add_argument("--epochs",type=int,default=1)
+    ap.add_argument("--lr",type=float,default=7.5e-5)
     ap.add_argument("--weight_decay",type=float,default=0.01)
     ap.add_argument("--H",type=int,default=30)
     ap.add_argument("--mu",type=float,default=0.9)
-    ap.add_argument("--lr_nes",type=float,default=0.0005)
+    ap.add_argument("--lr_nes",type=float,default=0.7)
     ap.add_argument("--max_length",type=int,default=2048)
     ap.add_argument("--max_new_tokens",type=int,default=256)
     ap.add_argument("--max_train_samples",type=int,default=-1)

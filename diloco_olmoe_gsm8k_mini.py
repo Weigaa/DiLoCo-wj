@@ -13,6 +13,7 @@ from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
+import time
 
 def is_main(): return int(os.environ.get("RANK","0")) == 0
 def setup_ddp():
@@ -22,6 +23,22 @@ def cleanup_ddp():
     if dist.is_initialized():
         try: dist.barrier()
         except Exception: pass
+        dist.destroy_process_group()
+def ddp_barrier(local_rank: int, timeout_s: int = 600):
+    if not dist.is_initialized():
+        return
+    # 同步一下本地 CUDA，避免未完成的 kernel 拖死 barrier
+    if torch.cuda.is_available():
+        torch.cuda.synchronize(local_rank)
+
+    # 旧接口：无超时
+    backend = dist.get_backend()
+    if backend == "nccl":
+        dist.barrier(device_ids=[local_rank])
+    else:
+        dist.barrier()
+def destroy_pg():
+    if dist.is_available() and dist.is_initialized():
         dist.destroy_process_group()
 
 @dataclass
@@ -60,23 +77,48 @@ class GSM8KEval(Dataset):
         inp=self.tok(prompt,max_length=self.max_len,truncation=True,padding=False,return_tensors="pt")
         return {"input_ids":inp.input_ids[0],"attention_mask":inp.attention_mask[0],"gold_answer":a}
 
-def pad_left(tok, seqs: Iterable[torch.Tensor]) -> torch.Tensor:
-    L=max(t.size(0) for t in seqs); out=[]
+def pad_left_ids(tok, seqs):
+    L = max(t.size(0) for t in seqs)
+    out = []
     for t in seqs:
-        if t.size(0)<L:
-            pad=torch.full((L-t.size(0),),tok.pad_token_id,dtype=t.dtype)
-            t=torch.cat([pad,t],0)
+        if t.size(0) < L:
+            pad = torch.full((L - t.size(0),), tok.pad_token_id, dtype=t.dtype)
+            t = torch.cat([pad, t], 0)
         out.append(t)
-    return torch.stack(out,0)
+    return torch.stack(out, 0)
 
-def collate(batch: Dict[str,torch.Tensor]):
-    if isinstance(batch,dict): batch=[batch]
-    keys=batch[0].keys(); tok=collate.tok; out={}
+def pad_left_mask(seqs):
+    L = max(t.size(0) for t in seqs)
+    out = []
+    for t in seqs:
+        if t.size(0) < L:
+            pad = torch.zeros((L - t.size(0),), dtype=t.dtype)  # 注意 0
+            t = torch.cat([pad, t], 0)
+        out.append(t)
+    return torch.stack(out, 0)
+
+def pad_left_labels(seqs):
+    L = max(t.size(0) for t in seqs)
+    out = []
+    for t in seqs:
+        if t.size(0) < L:
+            pad = torch.full((L - t.size(0),), -100, dtype=t.dtype)  # 注意 -100
+            t = torch.cat([pad, t], 0)
+        out.append(t)
+    return torch.stack(out, 0)
+
+def collate(batch):
+    if isinstance(batch, dict): batch = [batch]
+    keys = batch[0].keys(); tok = collate.tok; out = {}
     for k in keys:
-        if k in ("input_ids","attention_mask","labels"):
-            out[k]=pad_left(tok,[b[k] for b in batch])
+        if k == "input_ids":
+            out[k] = pad_left_ids(tok, [b[k] for b in batch])
+        elif k == "attention_mask":
+            out[k] = pad_left_mask([b[k] for b in batch])
+        elif k == "labels":
+            out[k] = pad_left_labels([b[k] for b in batch])
         else:
-            out[k]=[b[k] for b in batch]
+            out[k] = [b[k] for b in batch]
     return out
 
 class NesterovGlobalState:
@@ -87,16 +129,17 @@ class NesterovGlobalState:
                 self.shadow[n]=p.detach().float().clone()
                 self.v[n]=torch.zeros_like(p,dtype=torch.float32,device=p.device)
     @torch.no_grad()
-    def sync_step(self, model: torch.nn.Module, mu: float, lr_nes: float, world: int):
+    def sync_step(self, model: torch.nn.Module, mu: float, lr_nes: float, world_size: int):
         for n,p in model.named_parameters():
             if not p.requires_grad: continue
             dist.all_reduce(p.data, op=dist.ReduceOp.SUM)
-            p_avg=(p.data/world).float()
+            p_avg=(p.data/world_size).float()
             s,v=self.shadow[n],self.v[n]
-            d=p_avg - s
+            d=s-p_avg
             v.mul_(mu).add_(d)
             s.add_(-lr_nes*(mu*v + d))
             p.data.copy_(s.to(p.data.dtype))
+        #以下操作确保参数一致，但理论上是多余的
         for _,p in model.named_parameters():
             if p.requires_grad: dist.broadcast(p.data, src=0)
 
@@ -110,17 +153,18 @@ def extract_num(s:str)->Optional[str]:
 def main():
     ap=argparse.ArgumentParser()
     ap.add_argument("--model_name",type=str,default="allenai/OLMoE-1B-7B-0924") # 已存在于本机 HF 缓存
-    ap.add_argument("--per_device_batch",type=int,default=1)
+    ap.add_argument("--per_device_batch",type=int,default=16)
     ap.add_argument("--epochs",type=int,default=1)
-    ap.add_argument("--lr",type=float,default=5e-5)
+    ap.add_argument("--lr",type=float,default=7.5e-5)
     ap.add_argument("--weight_decay",type=float,default=0.01)
-    ap.add_argument("--H",type=int,default=20)
+    ap.add_argument("--H",type=int,default=30)
     ap.add_argument("--mu",type=float,default=0.9)
-    ap.add_argument("--lr_nes",type=float,default=1.0)
-    ap.add_argument("--max_length",type=int,default=1024)
-    ap.add_argument("--max_new_tokens",type=int,default=128)
+    ap.add_argument("--lr_nes",type=float,default=0.7)
+    ap.add_argument("--max_length",type=int,default=2048)
+    ap.add_argument("--max_new_tokens",type=int,default=256)
     ap.add_argument("--max_train_samples",type=int,default=-1)
     ap.add_argument("--max_eval_samples",type=int,default=-1)
+    ap.add_argument("--mode",type=int,default=0)#定义4种mode，0=DiLoCo，1=DiLoCo-all，2=DDP，3=DiLoco_stream
     args=ap.parse_args()
 
     setup_ddp()
@@ -139,7 +183,7 @@ def main():
     if tok.pad_token is None: tok.pad_token=tok.eos_token
     tok.padding_side="left"; collate.tok=tok
 
-    model=AutoModelForCausalLM.from_pretrained(args.model_name, dtype=torch.bfloat16, low_cpu_mem_usage=True)
+    model=AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True)
     model.to(device)
 
     ddp=DDP(model,
@@ -161,31 +205,88 @@ def main():
     ], lr=args.lr, betas=(0.9,0.999), eps=1e-8)
 
     gstate=NesterovGlobalState(model)
+    #定义4种mode，0=DiLoCo，1=DiLoCo-all，2=DDP
+    mode = args.mode
+    print(f"computing with mode = {mode}")
+    if is_main(): 
+        print(f"[Train] world={world} epochs={args.epochs} H={args.H} mu={args.mu} lr_nes={args.lr_nes}")
+        begin = time.time()
 
-    if is_main(): print(f"[Train] world={world} epochs={args.epochs} H={args.H} mu={args.mu} lr_nes={args.lr_nes}")
     step_since_sync=0
     for ep in range(args.epochs):
         sampler.set_epoch(ep); ddp.train()
         for it,b in enumerate(loader):
-            print("process epoch", ep, "step", it)
-            with ddp.no_sync():
+            #DiLoCo
+            #DiLoCo-style: local AdamW step every iteration; Nesterov sync every H steps
+            if mode == 0:
+                with ddp.no_sync():
+                    out=ddp(input_ids=b["input_ids"].to(device),
+                            attention_mask=b["attention_mask"].to(device),
+                            labels=b["labels"].to(device))
+                    loss=out.loss
+                    if not torch.isfinite(loss):
+                        print("Found non-finite loss at step", it, "rank", rank)
+                        break
+                    loss.backward()
+                    #torch.nn.utils.clip_grad_norm_(ddp.parameters(), 1)
+                    optim.step(); optim.zero_grad(set_to_none=True)
+                    step_since_sync+=1
+                if step_since_sync>=args.H:
+                    ddp.eval()
+                    if device.type=="cuda": torch.cuda.synchronize()
+                    gstate.sync_step(ddp.module, mu=args.mu, lr_nes=args.lr_nes, world_size=world)
+                    ddp.train(); step_since_sync=0
+            elif mode == 1:
+            # #DiLoCo-all
                 out=ddp(input_ids=b["input_ids"].to(device),
                         attention_mask=b["attention_mask"].to(device),
                         labels=b["labels"].to(device))
                 loss=out.loss
+                loss.backward()           
+                optim.step(); optim.zero_grad(set_to_none=True)
+                step_since_sync+=1
+                if step_since_sync>=args.H:
+                    ddp.eval()
+                    if device.type=="cuda": torch.cuda.synchronize()
+                    gstate.sync_step(ddp.module, mu=args.mu, lr_nes=args.lr_nes, world_size=world)
+                    ddp.train(); step_since_sync=0
+            elif mode == 2:
+            # #DDP
+                out=ddp(input_ids=b["input_ids"].to(device),
+                attention_mask=b["attention_mask"].to(device),
+                labels=b["labels"].to(device))
+                loss=out.loss
                 loss.backward()
-            optim.step(); optim.zero_grad(set_to_none=True)
-            step_since_sync+=1
-            if step_since_sync>=args.H:
-                ddp.eval()
-                if device.type=="cuda": torch.cuda.synchronize()
-                gstate.sync_step(ddp.module, mu=args.mu, lr_nes=args.lr_nes, world_size=world)
-                ddp.train(); step_since_sync=0
+                optim.step(); optim.zero_grad(set_to_none=True)
             if is_main() and (it+1)%10==0:
                 print(f"[ep {ep}] it {it+1} loss={loss.item():.4f}")
-        gstate.sync_step(ddp.module, mu=args.mu, lr_nes=args.lr_nes, world_size=world)
+            elif mode == 3:
+                #NO TRAIN
+                break
+        # if mode != 2:
+        #     gstate.sync_step(ddp.module, mu=args.mu, lr_nes=args.lr_nes, world_size=world)
 
+    # ===== 训练结束，先做一次对齐，再分流 =====
+    ddp_barrier(local_rank)
+
+    # 非 rank0 直接退出分布式并结束进程（不再触发任何 dist/NCCL）
+    if rank != 0:
+        try:
+            # 尽快释放大对象，有助于回收显存
+            del ddp
+            del model
+        except Exception:
+            pass
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        destroy_pg()
+        return  # 结束该进程；只保留 rank0 继续执行下方评测
+    
     if rank==0:
+        end = time.time()
+        print(f"Training Total time: {end-begin:.2f} seconds")
+        testnum = 2000
         ddp.module.eval(); correct=0
         for i in range(len(eval_ds)):
             row=eval_ds[i]
@@ -199,9 +300,12 @@ def main():
             if pred is not None and gold is not None and pred.strip()==gold.strip():
                 correct+=1
             if (i+1)%50==0: print(f"[Eval] {i+1}/{len(eval_ds)} acc={correct/(i+1):.4f}")
-        print(f"GSM8K test accuracy: {correct/len(eval_ds):.4f} ({correct}/{len(eval_ds)})")
-
-    cleanup_ddp()
+            if i+1>=testnum: break
+        print(f"GSM8K test accuracy: {correct/(i+1):.4f} ({correct}/{i+1})")
+        end = time.time()
+        print(f"Total time: {end-begin:.2f} seconds")
+        #print(f"GSM8K test accuracy: {correct/len(eval_ds):.4f} ({correct}/{len(eval_ds)})")
+        destroy_pg()
 
 if __name__=="__main__":
     main()

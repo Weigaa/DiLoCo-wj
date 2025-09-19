@@ -22,6 +22,8 @@ Notes:
 - The exact Hugging Face model ID for "olmoe-1b-7b" may differ. Replace --model_name accordingly.
 - This script aims for clarity over peak performance. Consider fusing ops, using Flash-Attn, and Deepspeed for larger runs.
 - Mixed precision (bf16 if available, else fp16) is used.
+
+#not avaliable now
 """
 from __future__ import annotations
 import argparse
